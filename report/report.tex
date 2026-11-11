@@ -1,0 +1,346 @@
+\documentclass[12pt,a4paper,oneside]{article}
+\usepackage{fontspec}
+\setmainfont{Times New Roman}
+\setmonofont{Courier New}
+\usepackage[english,russian]{babel}
+\usepackage{geometry}
+\geometry{left=2.54cm,right=2.54cm,top=2.54cm,bottom=2.54cm}
+\usepackage{amsmath,amssymb,array,tabularx,booktabs}
+\usepackage{graphicx,listings,xcolor,hyperref,enumitem,titlesec}
+\titleformat*{\section}{\large\bfseries}
+\titleformat*{\subsection}{\normalsize\bfseries}
+\setcounter{secnumdepth}{0}
+\hypersetup{pdftitle={Отчёт по ЛР № 4. ОС. Вариант 18},pdfauthor={}}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+\sloppy
+\lstset{basicstyle=\footnotesize\ttfamily,frame=single,breaklines=true,
+  columns=fullflexible,numbers=left,numberstyle=\tiny,
+  showstringspaces=false,tabsize=4,keepspaces=true}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\newsection}[1]{\section{#1}}
+\newcommand{\smalltable}{\small}
+\begin{document}
+\begin{titlepage}
+\begin{center}
+\large МОСКОВСКИЙ АВИАЦИОННЫЙ ИНСТИТУТ\\
+(НАЦИОНАЛЬНЫЙ ИССЛЕДОВАТЕЛЬСКИЙ УНИВЕРСИТЕТ)
+\vspace{20pt}
+
+Институт №8 «Компьютерные науки и прикладная математика»\\
+Кафедра 806 «Вычислительная математика и программирование»
+\end{center}
+\vspace{65pt}
+\begin{center}
+\large\bfseries Отчет по лабораторной работе №4\\[7pt]
+по курсу «Операционные системы»
+\end{center}
+\vspace{40pt}
+\begin{center}
+\large\bfseries Тема: «Межпроцессное взаимодействие через отображаемую память»\\[7pt]
+Вариант 18
+\end{center}
+\vfill
+\begin{flushright}
+\begin{tabular}{rl}
+Выполнил(а): & А.\,Е. Пронина \\
+Группа: & М8О-203БВ-25 \\
+Преподаватель: & Е.\,С. Миронов \\
+\end{tabular}
+\end{flushright}
+\vspace{40pt}
+\begin{center}Москва, 2026\end{center}
+\end{titlepage}
+
+\section{Цель работы}
+Изучить работу с файловыми объектами и организацию обмена данными между процессами с помощью отображаемой памяти (file mapping). Реализовать передачу строк через \code{mmap()}, синхронизировать доступ POSIX-семафорами и обеспечить освобождение ресурсов при штатном завершении.
+
+\section{Постановка задачи}
+Для варианта 18 требуется реализовать родительский процесс и два дочерних процесса. Родитель считывает имена двух выходных файлов и строки стандартного ввода. Нечётные строки данных направляются первому ребёнку, чётные --- второму. Пустая строка также имеет номер и участвует в чередовании.
+
+Каждый дочерний процесс удаляет из полученных строк английские гласные и записывает результат в свой файл. В исследуемом коде удаляются символы \code{a, e, i, o, u} и их прописные варианты. Символ \code{y} и русские гласные данным фильтром не удаляются.
+
+Для ЛР № 4 обмен организуется через две области общей памяти. Дочерние процессы создаются с помощью \code{fork()}, после чего выполняется \code{execvp()} программы \code{child}. После EOF родитель передаёт признак завершения, ожидает детей и освобождает объекты общей памяти.
+
+\section{Архитектура решения}
+Программа состоит из двух исполняемых файлов: \code{parent} и \code{child}. Каждый ребёнок обслуживает собственный канал с единственным буфером.
+
+\begin{center}
+\fbox{\parbox{0.88\linewidth}{\centering
+Стандартный ввод $\longrightarrow$ \code{parent}\\[3pt]
+нечётные строки $\longrightarrow$ память 1 $\longrightarrow$ \code{child 1} $\longrightarrow$ файл 1\\[3pt]
+чётные строки $\longrightarrow$ память 2 $\longrightarrow$ \code{child 2} $\longrightarrow$ файл 2\\[3pt]
+В каждой области: данные, флаги и два POSIX-семафора
+}}
+\end{center}
+Служебные сообщения дочерних процессов выводятся в \code{stderr}. Результат фильтрации направляется в \code{stdout}, который ребёнок перенаправляет в выходной файл через \code{open()} и \code{dup2()}.
+
+\newsection{Общая память и протокол обмена}
+\subsection{Структура данных}
+В \code{shared.h} объявлена следующая структура:
+\begin{lstlisting}[language=C]
+#define BUFFER_SIZE 4096
+
+typedef struct {
+    sem_t can_write;
+    sem_t can_read;
+    size_t length;
+    int end_of_line;
+    int finished;
+    char text[BUFFER_SIZE];
+} SharedData;
+\end{lstlisting}
+\code{length} задаёт число передаваемых байтов; \code{end_of_line} отмечает последнюю часть строки; \code{finished} сообщает об окончании обмена. Буфер не обязан содержать завершающий нулевой байт: фильтр и \code{fwrite()} используют явную длину.
+
+Объекты именуются по шаблону \code{/lab4_<PID>_1} и \code{/lab4_<PID>_2}. В трассировке размер каждого отображения равен 4176 байтам: это размер всей структуры в данной сборке, а не только массива \code{text}. Размер полезной порции равен 4096 байтам.
+
+\subsection{Синхронизация}
+Оба семафора размещаются непосредственно в общей памяти. Параметр \code{pshared=1} при \code{sem_init()} разрешает межпроцессное использование. Начальные значения: \code{can_write=1}, \code{can_read=0}.
+\begin{enumerate}
+\item Родитель ожидает \code{can_write}, записывает данные, длину и флаги, затем выполняет \code{sem_post(can_read)}.
+\item Ребёнок ожидает \code{can_read}, обрабатывает порцию и записывает результат. После этого он выполняет \code{sem_post(can_write)}.
+\item Следующая порция перезаписывает буфер только после разрешения ребёнка. Между частями одной строки перевод строки не добавляется.
+\end{enumerate}
+При EOF отправляется сообщение с \code{finished=1}. Получив его, ребёнок освобождает семафор записи и завершает цикл.
+
+\newsection{Используемые механизмы ОС}
+\subsection{Отображение памяти}
+\code{shm_open()} создаёт или открывает именованный объект POSIX shared memory. \code{ftruncate()} задаёт его размер, а \code{mmap()} отображает объект в виртуальное адресное пространство процесса. После успешного отображения файловый дескриптор закрывается; само отображение продолжает существовать.
+
+Процессы имеют отдельные виртуальные адресные пространства. Поэтому один объект может находиться по разным виртуальным адресам у родителя и ребёнка. Флаг \code{MAP_SHARED} обеспечивает совместный доступ к изменениям объекта. При \code{MAP_PRIVATE} изменения через отображение не использовались бы как общий канал записи между процессами.
+
+Одного \code{MAP_SHARED} недостаточно для согласования доступа: семафоры задают порядок заполнения и чтения буфера. Они предотвращают чтение частично подготовленного сообщения и перезапись ещё не обработанных данных.
+
+\subsection{Распределение и обработка строк}
+В \code{parent.c} строка читается функцией \code{getline()}, завершающий \code{\n} исключается из полезных данных. Выбор ребёнка выполняется по остатку от деления счётчика \code{line_number} на 2. Счётчик начинается с нуля, поэтому первая строка направляется ребёнку 1.
+
+\code{send_line()} разбивает строку на части до 4096 байт. Цикл \code{do ... while} отправляет сообщение даже для пустой строки: длина равна нулю, а \code{end_of_line=1}. Ребёнок в этом случае записывает один перевод строки.
+
+\code{remove_vowels()} проходит по данным один раз и уплотняет сохраняемые символы в том же буфере. Для строки длины $n$ обработка занимает $O(n)$ времени и $O(1)$ дополнительной памяти фильтра. Память родителя для \code{getline()} зависит от длины строки.
+
+\newsection{Ключевые фрагменты исходного кода}
+Ниже приведены ключевые фрагменты программы. Обозначение \code{/* ... */} показывает сокращённые участки обработки ошибок.
+
+\subsection{Создание области общей памяти}
+Основные операции функции \code{create_shared()} из \code{shared.c}:
+\begin{lstlisting}[language=C]
+int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
+/* ... */
+if (ftruncate(fd, sizeof(SharedData)) == -1) {
+    perror("ftruncate");
+    cleanup_shared(name, fd, MAP_FAILED, 0, 0);
+    return -1;
+}
+void* ptr = mmap(NULL, sizeof(SharedData),
+    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+/* ... */
+SharedData* shared = (SharedData*)ptr;
+if (sem_init(&shared->can_write, 1, 1) == -1) {
+    /* ... */
+}
+if (sem_init(&shared->can_read, 1, 0) == -1) {
+    /* ... */
+}
+\end{lstlisting}
+\code{O_EXCL} предотвращает открытие уже существующего объекта под видом нового. Функция \code{cleanup_shared()} освобождает успешно созданные части ресурса при ошибке и удаляет имя объекта.
+
+\subsection{Публикация сообщения}
+В \code{send_message()} родитель ожидает \code{can_write} через \code{sem_timedwait()} с очередным сроком ожидания через одну секунду. После \code{EINTR} или \code{ETIMEDOUT} выполняется \code{waitpid(..., WNOHANG)}: обнаруженное завершение ребёнка прерывает передачу. После успешного ожидания выполняется:
+\begin{lstlisting}[language=C]
+if (length > 0) memcpy(child->data->text, text, length);
+child->data->length = length;
+child->data->end_of_line = end_of_line;
+child->data->finished = finished;
+if (sem_post(&child->data->can_read) == -1) {
+    perror("sem_post");
+    return -1;
+}
+\end{lstlisting}
+
+\subsection{Передача строки частями}
+Функция \code{send_line()} из \code{parent.c} приведена полностью:
+\begin{lstlisting}[language=C]
+static int send_line(ChildInfo* child,
+                     const char* line, size_t length) {
+    size_t offset = 0;
+    do {
+        size_t part = length - offset;
+        if (part > BUFFER_SIZE) part = BUFFER_SIZE;
+        int last = (offset + part == length);
+        if (send_message(child, line + offset,
+                         part, last, 0) == -1)
+            return -1;
+        offset += part;
+    } while (offset < length);
+    return 0;
+}
+\end{lstlisting}
+Флаг \code{last} обеспечивает один перевод строки после всех её частей. Разбиение производится по байтам; английские гласные в фильтре представлены однобайтовыми ASCII-символами.
+
+\subsection{Приём и обработка в дочернем процессе}
+Ниже показаны основные действия цикла из \code{child.c}. Проверки ошибок вывода сокращены.
+\begin{lstlisting}[language=C]
+if (wait_for_data(&data->can_read) == -1) {
+    result = 1;
+    break;
+}
+if (data->finished) {
+    if (sem_post(&data->can_write) == -1) {
+        perror("sem_post");
+        result = 1;
+    }
+    break;
+}
+/* ... */
+size_t length = remove_vowels(data->text, data->length);
+if (length > 0) {
+    if (fwrite(data->text, 1, length, stdout) != length) {
+        /* ... */
+    }
+}
+if (data->end_of_line) {
+    if (fputc('\n', stdout) == EOF) { /* ... */ }
+}
+if (sem_post(&data->can_write) == -1) { /* ... */ }
+\end{lstlisting}
+
+\subsection{Фильтрация и освобождение ресурсов}
+Функция из \code{filter.c} выполняет фильтрацию без выделения второго буфера:
+\begin{lstlisting}[language=C]
+size_t remove_vowels(char* text, size_t length) {
+    size_t j = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (!is_vowel(text[i])) text[j++] = text[i];
+    }
+    return j;
+}
+\end{lstlisting}
+\code{is_vowel()} сравнивает символ с \code{a,e,i,o,u,A,E,I,O,U}. Цифры, знаки пунктуации и согласные сохраняются в прежнем порядке.
+
+Перед очисткой родитель ожидает завершения каждого ещё не собранного ребёнка через \code{waitpid()}; ожидание повторяется при \code{EINTR}. Проверяются \code{WIFEXITED(status)} и \code{WEXITSTATUS(status)}. Затем вызывается \code{destroy_shared()} для каждой созданной области.
+
+В \code{destroy_shared()} последовательно выполняются следующие вызовы (между ними в исходнике находятся проверки результата):
+\begin{lstlisting}[language=C]
+sem_destroy(&data->can_write)
+sem_destroy(&data->can_read)
+munmap(data, sizeof(SharedData))
+shm_unlink(name)
+\end{lstlisting}
+Ребёнок снимает собственное отображение через \code{close_shared()}, где вызывается \code{munmap()}. \code{munmap()} освобождает отображение процесса, а \code{shm_unlink()} удаляет имя объекта. Это разные операции.
+
+\section{Сборка и запуск}
+Проект использует C11 и CMake. \code{parent} собирается из \code{parent.c} и \code{shared.c}; \code{child} --- из \code{child.c}, \code{filter.c} и \code{shared.c}. Обе цели связаны с \code{Threads::Threads}; для GNU/Clang включены \code{-Wall -Wextra -Wpedantic}.
+\begin{lstlisting}[language=bash]
+cmake -S . -B build
+cmake --build build
+cd build
+./parent
+\end{lstlisting}
+Запуск выполняется из \code{build}, поскольку путь \code{./child} в \code{execvp()} задан относительно текущего каталога.
+
+\newsection{Результаты функционального запуска}
+При интерактивном запуске родитель имел PID 52126, дети --- PID 52159 и 52160. Были указаны файлы \code{out1} и \code{out2}. Оба ребёнка вывели сообщения \code{started} и \code{finished}.
+
+Результаты обработки входных строк приведены в таблице. Обозначение $\varnothing$ означает пустую строку.
+
+\begin{center}
+\smalltable
+\begin{tabularx}{\linewidth}{@{}c c >{\raggedright\arraybackslash}X >{\raggedright\arraybackslash}X@{}}
+\toprule
+№ & Файл & Входная строка & Результат\\
+\midrule
+1 & \code{out1} & \code{aaaaaaa} & $\varnothing$\\
+2 & \code{out2} & $\varnothing$ & $\varnothing$\\
+3 & \code{out1} & $\varnothing$ & $\varnothing$\\
+4 & \code{out2} & \code{akdlkasldkalk} & \code{kdlksldklk}\\
+5 & \code{out1} & \code{paspofk} & \code{pspfk}\\
+6 & \code{out2} & \code{slkfslakjf} & \code{slkfslkjf}\\
+7 & \code{out1} & Строка со скобками, буквами и цифрами (см. ниже) & См. точный результат ниже\\
+8 & \code{out2} & \code{gggg} & \code{gggg}\\
+9 & \code{out1} & \code{;amibfws34} & \code{;mbfws34}\\
+\bottomrule
+\end{tabularx}
+\end{center}
+Для строки 7 исходное и полученное значения:
+\begin{lstlisting}
+[]][[weflkcaonijefj98549jos[apvk[pmdbna
+[]][[wflkcnjfj98549js[pvk[pmdbn
+\end{lstlisting}
+Файл \code{out1} содержит 49 байт и 5 переводов строки, \code{out2} --- 27 байт и 4 перевода строки. Девять входных строк распределены между процессами в соотношении 5/4.
+
+Запуск показывает обработку пустых строк, удаление строчных английских гласных и сохранение согласных, цифр и специальных символов.
+
+\newsection{Анализ трассировки strace}
+\subsection{Порядок запуска}
+Для исследования системных вызовов использована команда:
+\begin{lstlisting}[language=bash]
+printf 'trace1\ntrace2\nhello\nworld\n' | strace -f \
+  -e trace=process,memory,openat,close,ftruncate,futex,unlink,unlinkat \
+  -o trace.log ./parent
+\end{lstlisting}
+В файлах \code{trace1} и \code{trace2} получены соответственно \code{hll\n} (4 байта) и \code{wrld\n} (5 байт). Гласные из строк \code{hello} и \code{world} удалены.
+
+\subsection{Создание и подключение общей памяти}
+Ниже приведены системные вызовы, связанные с созданием и подключением общей памяти.
+\begin{lstlisting}
+54251 openat(AT_FDCWD, "/dev/shm/lab4_54251_1", O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600) = 3
+54251 ftruncate(3, 4176)                = 0
+54251 mmap(NULL, 4176, PROT_READ|PROT_WRITE, MAP_SHARED, 3, 0) = 0x7171c1138000
+54251 openat(AT_FDCWD, "/dev/shm/lab4_54251_2", O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600) = 3
+54251 ftruncate(3, 4176)                = 0
+54251 mmap(NULL, 4176, PROT_READ|PROT_WRITE, MAP_SHARED, 3, 0) = 0x7171c1136000
+54252 openat(AT_FDCWD, "/dev/shm/lab4_54251_1", O_RDWR|O_NOFOLLOW|O_CLOEXEC) = 3
+54252 mmap(NULL, 4176, PROT_READ|PROT_WRITE, MAP_SHARED, 3, 0 <unfinished ...>
+54252 <... mmap resumed>)               = 0x7757db6ae000
+54253 openat(AT_FDCWD, "/dev/shm/lab4_54251_2", O_RDWR|O_NOFOLLOW|O_CLOEXEC) = 3
+54253 mmap(NULL, 4176, PROT_READ|PROT_WRITE, MAP_SHARED, 3, 0) = 0x7f27a4763000
+\end{lstlisting}
+Родитель 54251 создал два объекта, а процессы 54252 и 54253 открыли по одному объекту каждый. Для всех четырёх отображений указан \code{MAP_SHARED}. Разные адреса одного объекта у родителя и ребёнка подтверждают независимость их виртуальных адресных пространств.
+
+\subsection{Синхронизация и штатная очистка}
+Выдержка с ожиданием родителя и пробуждением со стороны ребёнка:
+\begin{lstlisting}
+54251 futex(0x7171c1138000, FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME, 0, {tv_sec=1794436131, tv_nsec=979383363}, FUTEX_BITSET_MATCH_ANY <unfinished ...>
+54252 futex(0x7757db6ae000, FUTEX_WAKE, 1 <unfinished ...>
+54251 <... futex resumed>)              = 0
+54252 <... futex resumed>)              = 1
+\end{lstlisting}
+Адреса соответствуют началу отображений первого объекта, где в \code{SharedData} расположен \code{can_write}. С учётом исходного кода эти операции согласуются с ожиданием и освобождением семафора. Не каждый вызов POSIX-семафора требует отдельного системного вызова, поэтому число операций обмена по числу строк \code{futex} не определяется.
+
+Завершающая часть трассы содержит следующие выбранные строки:
+\begin{lstlisting}
+54252 munmap(0x7757db6ae000, 4176 <unfinished ...>
+54252 <... munmap resumed>)             = 0
+54253 munmap(0x7f27a4763000, 4176)      = 0
+54252 +++ exited with 0 +++
+54253 +++ exited with 0 +++
+54251 munmap(0x7171c1138000, 4176)      = 0
+54251 unlink("/dev/shm/lab4_54251_1")   = 0
+54251 munmap(0x7171c1136000, 4176)      = 0
+54251 unlink("/dev/shm/lab4_54251_2")   = 0
+54251 +++ exited with 0 +++
+\end{lstlisting}
+Также в трассе присутствуют уведомления \code{SIGCHLD} для обоих детей со значением \code{si_status=0}. Дети сняли собственные отображения и завершились с кодом 0. Родитель снял оба отображения, успешно удалил оба имени через \code{unlink()} и завершился с кодом 0.
+
+При штатном завершении освобождены отображения и удалены имена обоих созданных объектов общей памяти.
+
+\newsection{Итоги проверки и выводы}
+\begin{center}
+\smalltable
+\begin{tabularx}{\linewidth}{@{}>{\raggedright\arraybackslash}p{0.39\linewidth} >{\raggedright\arraybackslash}X@{}}
+\toprule
+Проверяемое свойство & Основание и результат\\
+\midrule
+Два дочерних процесса & В интерактивном запуске указаны PID 52159 и 52160; в трассе видны процессы 54252 и 54253.\\
+Чередование строк и фильтрация & Файлы \code{out1/out2}: 5 и 4 строки, результаты соответствуют вводу.\\
+Пустые строки и строка из гласных & Пустые результаты сохранены как отдельные строки.\\
+Две области \code{MAP_SHARED} & Трасса содержит создание и подключение объектов по 4176 байт.\\
+Завершение и очистка в трассируемом запуске & Три кода завершения 0; успешные \code{munmap()} и два \code{unlink()}.\\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+В работе реализован обмен строками между родителем и двумя дочерними процессами через именованные объекты общей памяти. Семафоры \code{can_write} и \code{can_read} обеспечивают последовательную передачу порций в каждом канале. Разделение признаков конца строки и конца обмена позволяет сохранять пустые строки и передавать строки частями.
+
+Результаты запуска подтверждают фильтрацию строк и работу двух каналов. Трассировка показывает создание общей памяти, совместные отображения, операции ожидания и пробуждения, а также штатное освобождение ресурсов.
+\end{document}
